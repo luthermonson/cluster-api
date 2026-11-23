@@ -84,6 +84,15 @@ const (
 	//
 	// alpha: v1.12
 	MachineTaintPropagation featuregate.Feature = "MachineTaintPropagation"
+
+	// SelfHostedDeletion is a feature gate for ordering Machine deletion when a Cluster that hosts its own
+	// management components (a self-hosted management cluster) is deleted.
+	// When enabled, Machines whose Nodes run Cluster API provider Pods are deleted after all other Machines,
+	// one at a time in a deterministic order (infrastructure provider hosts last), and provider Pods are
+	// evicted from a Node before its Machine is deleted so they reschedule onto a surviving Node.
+	//
+	// alpha: v1.12 (fork only)
+	SelfHostedDeletion featuregate.Feature = "SelfHostedDeletion"
 )
 
 func init() {
@@ -104,4 +113,5 @@ var defaultClusterAPIFeatureGates = map[featuregate.Feature]featuregate.FeatureS
 	RuntimeSDK:                     {Default: false, PreRelease: featuregate.Alpha},
 	InPlaceUpdates:                 {Default: false, PreRelease: featuregate.Alpha},
 	MachineTaintPropagation:        {Default: false, PreRelease: featuregate.Alpha},
+	SelfHostedDeletion:             {Default: false, PreRelease: featuregate.Alpha},
 }
