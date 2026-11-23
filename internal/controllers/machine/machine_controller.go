@@ -488,6 +488,15 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 		}
 	}
 
+	// If the Cluster is being deleted and it hosts its own management components (self-hosted management cluster),
+	// delete Machines hosting management components last and in order, and move management components off a
+	// Node before its Machine is deleted.
+	if errors.Is(err, errClusterIsBeingDeleted) && feature.Gates.Enabled(feature.SelfHostedDeletion) {
+		if result, err := r.reconcileSelfHostedDelete(ctx, s); err != nil || !result.IsZero() {
+			return result, err
+		}
+	}
+
 	if isDeleteNodeAllowed {
 		// pre-drain.delete lifecycle hook
 		// Return early without error, will requeue if/when the hook owner removes the annotation.
