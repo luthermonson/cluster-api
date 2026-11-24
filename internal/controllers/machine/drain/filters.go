@@ -372,3 +372,12 @@ func matchesSelector(labelSelector *metav1.LabelSelector, obj client.Object) boo
 
 	return selector.Matches(labels.Set(obj.GetLabels()))
 }
+
+// NewPodDeleteListForEviction returns a PodDeleteList in which all the given Pods are to be evicted
+// (DrainBehavior "Drain", order 0), bypassing the regular drain filters and MachineDrainRules.
+// It is used to evict a specific, pre-selected set of Pods (e.g. management components) from a Node.
+func NewPodDeleteListForEviction(ctx context.Context, pods []*corev1.Pod) *PodDeleteList {
+	return filterPods(ctx, pods, []PodFilter{
+		func(context.Context, *corev1.Pod) PodDeleteStatus { return MakePodDeleteStatusOkay() },
+	})
+}

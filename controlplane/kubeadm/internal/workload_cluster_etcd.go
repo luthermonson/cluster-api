@@ -21,6 +21,7 @@ import (
 
 	"github.com/pkg/errors"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	bootstrapv1 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -60,6 +61,47 @@ loopmembers:
 		if err := w.removeMemberForNode(ctx, member.Name); err != nil {
 			errs = append(errs, err)
 		}
+	}
+
+	return removedMembers, kerrors.NewAggregate(errs)
+}
+
+// RemoveEtcdMembersWithoutNodes lists the current etcd members through the etcd instances hosted on nodeNames and
+// removes every member whose name is not one of nodeNames. It returns the names of the removed members.
+// Unlike ReconcileEtcdMembersAndControlPlaneNodes it does not rely on a previously collected member list and only
+// dials the given Nodes, so Nodes whose etcd is already gone do not cost a failed connection attempt.
+// It is used while a self-hosted cluster is being deleted, where the etcd member of a control plane Machine is kept
+// until the Machine is gone and has to be removed before the next Machine is deleted.
+func (w *Workload) RemoveEtcdMembersWithoutNodes(ctx context.Context, nodeNames []string) ([]string, error) {
+	if len(nodeNames) == 0 {
+		return nil, errors.New("invalid argument: RemoveEtcdMembersWithoutNodes can't be called with an empty list of nodes")
+	}
+
+	etcdClient, err := w.etcdClientGenerator.forFirstAvailableNode(ctx, nodeNames)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create etcd client")
+	}
+	defer etcdClient.Close()
+
+	// List etcd members. This checks that the member is healthy, because the request goes through consensus.
+	members, err := etcdClient.Members(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to list etcd members using etcd client")
+	}
+
+	nodes := sets.New(nodeNames...)
+	removedMembers := []string{}
+	errs := []error{}
+	for _, member := range members {
+		// If this member is just added, it has a empty name until the etcd pod starts. Ignore it.
+		if member.Name == "" || nodes.Has(member.Name) {
+			continue
+		}
+		if err := etcdClient.RemoveMember(ctx, member.ID); err != nil {
+			errs = append(errs, errors.Wrapf(err, "failed to remove member %s from etcd", member.Name))
+			continue
+		}
+		removedMembers = append(removedMembers, member.Name)
 	}
 
 	return removedMembers, kerrors.NewAggregate(errs)

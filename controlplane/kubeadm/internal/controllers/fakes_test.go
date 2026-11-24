@@ -22,6 +22,7 @@ import (
 
 	"github.com/blang/semver/v4"
 	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bootstrapv1 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
@@ -75,6 +76,10 @@ type fakeWorkloadCluster struct {
 
 	forwardEtcdLeadershipCalled      int
 	removeEtcdMemberForMachineCalled int
+	// removeEtcdMembersWithoutNodesCalled counts calls to RemoveEtcdMembersWithoutNodes; the fake removes the
+	// members of EtcdMembersResult that are not in the given node names and records them in removedEtcdMembers.
+	removeEtcdMembersWithoutNodesCalled int
+	removedEtcdMembers                  []string
 }
 
 func (f *fakeWorkloadCluster) ForwardEtcdLeadership(_ context.Context, _ *clusterv1.Machine, leaderCandidate *clusterv1.Machine) error {
@@ -87,6 +92,23 @@ func (f *fakeWorkloadCluster) ForwardEtcdLeadership(_ context.Context, _ *cluste
 
 func (f *fakeWorkloadCluster) ReconcileEtcdMembersAndControlPlaneNodes(_ context.Context, _ []*etcd.Member, _ []string) ([]string, error) {
 	return nil, nil
+}
+
+func (f *fakeWorkloadCluster) RemoveEtcdMembersWithoutNodes(_ context.Context, nodeNames []string) ([]string, error) {
+	f.removeEtcdMembersWithoutNodesCalled++
+	nodes := sets.New(nodeNames...)
+	removed := []string{}
+	remaining := []string{}
+	for _, member := range f.EtcdMembersResult {
+		if nodes.Has(member) {
+			remaining = append(remaining, member)
+			continue
+		}
+		removed = append(removed, member)
+	}
+	f.EtcdMembersResult = remaining
+	f.removedEtcdMembers = append(f.removedEtcdMembers, removed...)
+	return removed, nil
 }
 
 func (f *fakeWorkloadCluster) ClusterStatus(_ context.Context) (internal.ClusterStatus, error) {

@@ -3798,6 +3798,210 @@ func TestKubeadmControlPlaneReconciler_reconcileDelete(t *testing.T) {
 		g.Expect(controlPlane.DeletingMessage).To(Equal("Deletion completed"))
 	})
 
+	t.Run("keeps the pre-terminate hook and shrinks etcd one Machine at a time with the SelfHostedDeletion feature gate", func(t *testing.T) {
+		utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.SelfHostedDeletion, true)
+		g := NewWithT(t)
+
+		cluster, kcp, _ := createClusterWithControlPlane(metav1.NamespaceDefault)
+		controllerutil.AddFinalizer(kcp, controlplanev1.KubeadmControlPlaneFinalizer)
+		kcp.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		initObjs := []client.Object{cluster.DeepCopy(), kcp.DeepCopy()}
+
+		machines := collections.New()
+		for i := range 3 {
+			m, _ := createMachineNodePair(fmt.Sprintf("test-%d", i), cluster, kcp, true)
+			m.Annotations[controlplanev1.PreTerminateHookCleanupAnnotation] = ""
+			// Note: Block deletion so we can later verify the pre-terminate hook handling.
+			m.Finalizers = []string{"cluster.x-k8s.io/block-deletion"}
+			initObjs = append(initObjs, m)
+			machines.Insert(m)
+		}
+
+		fakeClient := newFakeClient(initObjs...)
+		// etcd has one member per Machine (createMachineNodePair names the Node like the Machine).
+		workloadCluster := &fakeWorkloadCluster{EtcdMembersResult: []string{"test-0", "test-1", "test-2"}}
+		r := &KubeadmControlPlaneReconciler{
+			Client:              fakeClient,
+			SecretCachingClient: fakeClient,
+			managementCluster: &fakeManagementCluster{
+				Management: &internal.Management{Client: fakeClient},
+				Workload:   workloadCluster,
+			},
+			recorder: record.NewFakeRecorder(32),
+		}
+
+		controlPlane := &internal.ControlPlane{
+			KCP:      kcp,
+			Cluster:  cluster,
+			Machines: machines,
+		}
+		controlPlane.InjectTestManagementCluster(r.managementCluster)
+
+		// First pass: all Machines are deleted, the pre-terminate hook stays on all of them.
+		result, err := r.reconcileDelete(ctx, controlPlane)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(result).To(Equal(ctrl.Result{RequeueAfter: deleteRequeueAfter}))
+		g.Expect(controlPlane.DeletingReason).To(Equal(controlplanev1.KubeadmControlPlaneDeletingWaitingForMachineDeletionReason))
+		g.Expect(controlPlane.DeletingMessage).To(Equal("Deleting 3 Machines"))
+		g.Expect(workloadCluster.forwardEtcdLeadershipCalled).To(Equal(0))
+		g.Expect(workloadCluster.removeEtcdMemberForMachineCalled).To(Equal(0))
+		g.Expect(workloadCluster.removeEtcdMembersWithoutNodesCalled).To(Equal(0))
+
+		controlPlaneMachines := clusterv1.MachineList{}
+		g.Expect(fakeClient.List(ctx, &controlPlaneMachines)).To(Succeed())
+		g.Expect(controlPlaneMachines.Items).To(HaveLen(3))
+		for _, machine := range controlPlaneMachines.Items {
+			g.Expect(machine.DeletionTimestamp.IsZero()).To(BeFalse(), "Machine %s should be deleting", machine.Name)
+			g.Expect(machine.Annotations).To(HaveKey(controlplanev1.PreTerminateHookCleanupAnnotation), "Machine %s should keep the pre-terminate hook", machine.Name)
+		}
+
+		// Second pass: the Machine controller ordered the Machines and reached the pre-terminate hook on test-1 only
+		// (test-0 has the oldest deletionTimestamp but is waiting for its turn, test-2 as well).
+		machines = collections.New()
+		for i := range controlPlaneMachines.Items {
+			m := &controlPlaneMachines.Items[i]
+			m.DeletionTimestamp = &metav1.Time{Time: time.Now().Add(-time.Duration(3-i) * time.Minute)}
+			if m.Name == "test-1" {
+				conditions.Set(m, metav1.Condition{
+					Type:   clusterv1.MachineDeletingCondition,
+					Status: metav1.ConditionTrue,
+					Reason: clusterv1.MachineDeletingWaitingForPreTerminateHookReason,
+				})
+			}
+			machines.Insert(m)
+		}
+		controlPlane = &internal.ControlPlane{
+			KCP:      kcp,
+			Cluster:  cluster,
+			Machines: machines,
+		}
+		controlPlane.InjectTestManagementCluster(r.managementCluster)
+
+		result, err = r.reconcileDelete(ctx, controlPlane)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(result).To(Equal(ctrl.Result{RequeueAfter: deleteRequeueAfter}))
+		g.Expect(controlPlane.DeletingReason).To(Equal(controlplanev1.KubeadmControlPlaneDeletingWaitingForMachineDeletionReason))
+		// etcd leadership is forwarded to another Machine (all are deleting). With three Machines the member of test-1
+		// is kept: etcd keeps quorum without it and the API server on test-1 dies with the Machine instead of
+		// lingering without etcd. No Machine is gone yet, so there is no stale member to remove either.
+		g.Expect(workloadCluster.forwardEtcdLeadershipCalled).To(Equal(1))
+		g.Expect(workloadCluster.removeEtcdMemberForMachineCalled).To(Equal(0))
+		g.Expect(workloadCluster.removeEtcdMembersWithoutNodesCalled).To(Equal(1))
+		g.Expect(workloadCluster.removedEtcdMembers).To(BeEmpty())
+		g.Expect(workloadCluster.EtcdMembersResult).To(ConsistOf("test-0", "test-1", "test-2"))
+
+		g.Expect(fakeClient.List(ctx, &controlPlaneMachines)).To(Succeed())
+		for _, machine := range controlPlaneMachines.Items {
+			if machine.Name == "test-1" {
+				g.Expect(machine.Annotations).ToNot(HaveKey(controlplanev1.PreTerminateHookCleanupAnnotation), "pre-terminate hook should have been removed from Machine %s", machine.Name)
+			} else {
+				g.Expect(machine.Annotations).To(HaveKey(controlplanev1.PreTerminateHookCleanupAnnotation), "Machine %s should keep the pre-terminate hook", machine.Name)
+			}
+		}
+
+		// Third pass: test-1 is gone, test-2 reached the pre-terminate hook, test-0 is still waiting for its turn.
+		g.Expect(fakeClient.List(ctx, &controlPlaneMachines)).To(Succeed())
+		machines = collections.New()
+		for i := range controlPlaneMachines.Items {
+			m := &controlPlaneMachines.Items[i]
+			switch m.Name {
+			case "test-1":
+				m.Finalizers = nil
+				g.Expect(fakeClient.Update(ctx, m)).To(Succeed())
+				continue
+			case "test-2":
+				conditions.Set(m, metav1.Condition{
+					Type:   clusterv1.MachineDeletingCondition,
+					Status: metav1.ConditionTrue,
+					Reason: clusterv1.MachineDeletingWaitingForPreTerminateHookReason,
+				})
+			}
+			m.DeletionTimestamp = &metav1.Time{Time: time.Now().Add(-time.Duration(3-i) * time.Minute)}
+			machines.Insert(m)
+		}
+		g.Expect(machines.Len()).To(Equal(2))
+		controlPlane = &internal.ControlPlane{
+			KCP:      kcp,
+			Cluster:  cluster,
+			Machines: machines,
+		}
+		controlPlane.InjectTestManagementCluster(r.managementCluster)
+
+		result, err = r.reconcileDelete(ctx, controlPlane)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(result).To(Equal(ctrl.Result{RequeueAfter: deleteRequeueAfter}))
+		// The stale member of test-1 (gone) is removed first: 3 -> 2. Then, with two Machines left, the member of
+		// test-2 has to be removed before its infrastructure goes away, otherwise test-0 is left without quorum: 2 -> 1.
+		g.Expect(workloadCluster.forwardEtcdLeadershipCalled).To(Equal(2))
+		g.Expect(workloadCluster.removeEtcdMembersWithoutNodesCalled).To(Equal(2))
+		g.Expect(workloadCluster.removedEtcdMembers).To(ConsistOf("test-1"))
+		g.Expect(workloadCluster.EtcdMembersResult).To(ConsistOf("test-0", "test-2"))
+		g.Expect(workloadCluster.removeEtcdMemberForMachineCalled).To(Equal(1))
+
+		g.Expect(fakeClient.List(ctx, &controlPlaneMachines)).To(Succeed())
+		g.Expect(controlPlaneMachines.Items).To(HaveLen(2))
+		for _, machine := range controlPlaneMachines.Items {
+			if machine.Name == "test-2" {
+				g.Expect(machine.Annotations).ToNot(HaveKey(controlplanev1.PreTerminateHookCleanupAnnotation), "pre-terminate hook should have been removed from Machine %s", machine.Name)
+			} else {
+				g.Expect(machine.Annotations).To(HaveKey(controlplanev1.PreTerminateHookCleanupAnnotation), "Machine %s should keep the pre-terminate hook", machine.Name)
+			}
+		}
+	})
+
+	t.Run("unblocks the last control plane Machine without touching etcd with the SelfHostedDeletion feature gate", func(t *testing.T) {
+		utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.SelfHostedDeletion, true)
+		g := NewWithT(t)
+
+		cluster, kcp, _ := createClusterWithControlPlane(metav1.NamespaceDefault)
+		controllerutil.AddFinalizer(kcp, controlplanev1.KubeadmControlPlaneFinalizer)
+		kcp.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+
+		// The last Machine: deleting, hook still set, Machine controller waiting for the hook.
+		m, _ := createMachineNodePair("test-last", cluster, kcp, true)
+		m.Annotations[controlplanev1.PreTerminateHookCleanupAnnotation] = ""
+		m.Finalizers = []string{"cluster.x-k8s.io/block-deletion"}
+		m.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		conditions.Set(m, metav1.Condition{
+			Type:   clusterv1.MachineDeletingCondition,
+			Status: metav1.ConditionTrue,
+			Reason: clusterv1.MachineDeletingWaitingForPreTerminateHookReason,
+		})
+
+		fakeClient := newFakeClient(cluster.DeepCopy(), kcp.DeepCopy(), m.DeepCopy())
+		workloadCluster := &fakeWorkloadCluster{}
+		r := &KubeadmControlPlaneReconciler{
+			Client:              fakeClient,
+			SecretCachingClient: fakeClient,
+			managementCluster: &fakeManagementCluster{
+				Management: &internal.Management{Client: fakeClient},
+				Workload:   workloadCluster,
+			},
+			recorder: record.NewFakeRecorder(32),
+		}
+
+		controlPlane := &internal.ControlPlane{
+			KCP:      kcp,
+			Cluster:  cluster,
+			Machines: collections.FromMachines(m),
+		}
+		controlPlane.InjectTestManagementCluster(r.managementCluster)
+
+		result, err := r.reconcileDelete(ctx, controlPlane)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(result).To(Equal(ctrl.Result{RequeueAfter: deleteRequeueAfter}))
+		g.Expect(controlPlane.DeletingReason).To(Equal(controlplanev1.KubeadmControlPlaneDeletingWaitingForMachineDeletionReason))
+		g.Expect(controlPlane.DeletingMessage).To(Equal("Deleting 1 Machine"))
+		// No other member to forward leadership to, no member to remove, nothing stale to sweep.
+		g.Expect(workloadCluster.forwardEtcdLeadershipCalled).To(Equal(0))
+		g.Expect(workloadCluster.removeEtcdMemberForMachineCalled).To(Equal(0))
+		g.Expect(workloadCluster.removeEtcdMembersWithoutNodesCalled).To(Equal(0))
+
+		got := &clusterv1.Machine{}
+		g.Expect(fakeClient.Get(ctx, client.ObjectKeyFromObject(m), got)).To(Succeed())
+		g.Expect(got.Annotations).ToNot(HaveKey(controlplanev1.PreTerminateHookCleanupAnnotation))
+	})
+
 	t.Run("does not remove any control plane Machines if other Machines exist", func(t *testing.T) {
 		g := NewWithT(t)
 

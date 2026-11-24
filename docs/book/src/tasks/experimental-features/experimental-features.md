@@ -21,6 +21,11 @@ Currently Cluster API has the following experimental features:
 * `PriorityQueue` (env var: `EXP_PRIORITY_QUEUE`): Enables the usage of the controller-runtime PriorityQueue: https://github.com/kubernetes-sigs/controller-runtime/issues/2374
 * `ReconcilerRateLimiting` (env var: `EXP_RECONCILER_RATE_LIMITING`): Enables reconciler rate-limiting: https://github.com/kubernetes-sigs/cluster-api/issues/13005
 * `RuntimeSDK` (env var: `EXP_RUNTIME_SDK`): [RuntimeSDK](./runtime-sdk/index.md)
+* `SelfHostedDeletion` (env var: `EXP_SELF_HOSTED_DELETION`): fork-only experiment. When a Cluster that hosts its own
+  Cluster API components is deleted, Machines hosting provider Pods are deleted last and in order, and the kubeadm
+  control plane provider removes the etcd member of each control plane Machine before it is deleted so that etcd
+  keeps quorum until the last Machine. The gate has to be enabled on both the core provider and the kubeadm control
+  plane provider (the environment variable sets both). See `docs/proposals/README-selfhosted-deletion.md`.
 
 ## Enabling Experimental Features for Management Clusters Started with clusterctl
 

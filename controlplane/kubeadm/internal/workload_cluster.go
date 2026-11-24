@@ -97,6 +97,7 @@ type WorkloadCluster interface {
 
 	// State recovery tasks.
 	ReconcileEtcdMembersAndControlPlaneNodes(ctx context.Context, members []*etcd.Member, nodeNames []string) ([]string, error)
+	RemoveEtcdMembersWithoutNodes(ctx context.Context, nodeNames []string) ([]string, error)
 }
 
 // Workload defines operations on workload clusters.

@@ -700,9 +700,17 @@ func (r *KubeadmControlPlaneReconciler) reconcileDelete(ctx context.Context, con
 		// to forward etcd leadership without any member left after we went through the Machine deletion.
 		// Also in this case the reconcileDelete code of the Machine controller won't execute Node drain
 		// and wait for volume detach.
-		if err := r.removePreTerminateHookAnnotationFromMachine(ctx, machineToDelete); err != nil {
-			errs = append(errs, err)
-			continue
+		//
+		// With the SelfHostedDeletion feature gate the pre-terminate hook is kept instead: the Machine controller
+		// deletes the control plane Machines of a self-hosted cluster one at a time, and the cluster's API server
+		// has to stay available until the last Machine is gone. etcd therefore must keep quorum while Machines go
+		// away, which reconcilePreTerminateHook (see below) ensures by letting the Machine controller delete the
+		// infrastructure of one Machine at a time and removing etcd members accordingly.
+		if !feature.Gates.Enabled(feature.SelfHostedDeletion) {
+			if err := r.removePreTerminateHookAnnotationFromMachine(ctx, machineToDelete); err != nil {
+				errs = append(errs, err)
+				continue
+			}
 		}
 
 		if !machineToDelete.DeletionTimestamp.IsZero() {
@@ -726,6 +734,19 @@ func (r *KubeadmControlPlaneReconciler) reconcileDelete(ctx context.Context, con
 		controlPlane.DeletingReason = controlplanev1.KubeadmControlPlaneDeletingInternalErrorReason
 		controlPlane.DeletingMessage = "Please check controller logs for errors"
 		return ctrl.Result{}, err
+	}
+
+	// With the SelfHostedDeletion feature gate the pre-terminate hook is still on the Machines (see above): run the
+	// pre-terminate hook for the Machine the Machine controller is currently waiting on, i.e. forward etcd leadership
+	// and remove its etcd member, and unblock its deletion. The last Machine has no member to remove and is
+	// unblocked right away.
+	// Note: Machines that got their deletionTimestamp in this reconcile are picked up on the next one.
+	if feature.Gates.Enabled(feature.SelfHostedDeletion) {
+		if _, err := r.reconcilePreTerminateHook(ctx, controlPlane); err != nil {
+			controlPlane.DeletingReason = controlplanev1.KubeadmControlPlaneDeletingInternalErrorReason
+			controlPlane.DeletingMessage = "Please check controller logs for errors"
+			return ctrl.Result{}, err
+		}
 	}
 
 	log.Info("Waiting for control plane Machines to not exist anymore")
@@ -1243,6 +1264,17 @@ func (r *KubeadmControlPlaneReconciler) reconcilePreTerminateHook(ctx context.Co
 	// Pick the Machine with the oldest deletionTimestamp to keep this function deterministic / reentrant
 	// so we only remove the pre-terminate hook from one Machine at a time.
 	deletingMachine := controlPlane.DeletingMachines().OldestDeletionTimestamp()
+	selfHostedDeletion := isSelfHostedKCPDeletion(controlPlane)
+	if selfHostedDeletion {
+		// While KCP itself is being deleted with the SelfHostedDeletion feature gate, all control plane Machines are
+		// deleting at the same time, but the Machine controller lets them reach the pre-terminate hook one at a time
+		// (Machines hosting management components wait for the others). Pick the Machine that is waiting for the
+		// hook; the one with the oldest deletionTimestamp might be waiting for the others and would never get there.
+		deletingMachine = controlPlane.DeletingMachines().Filter(isWaitingForPreTerminateHook).OldestDeletionTimestamp()
+		if deletingMachine == nil {
+			return ctrl.Result{RequeueAfter: deleteRequeueAfter}, nil
+		}
+	}
 	log = log.WithValues("Machine", klog.KObj(deletingMachine))
 	ctx = ctrl.LoggerInto(ctx, log)
 
@@ -1262,8 +1294,7 @@ func (r *KubeadmControlPlaneReconciler) reconcilePreTerminateHook(ctx context.Co
 	}
 
 	// Return early because the Machine controller is not yet waiting for the pre-terminate hook.
-	c := conditions.Get(deletingMachine, clusterv1.MachineDeletingCondition)
-	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != clusterv1.MachineDeletingWaitingForPreTerminateHookReason {
+	if !isWaitingForPreTerminateHook(deletingMachine) {
 		return ctrl.Result{RequeueAfter: deleteRequeueAfter}, nil
 	}
 
@@ -1277,10 +1308,34 @@ func (r *KubeadmControlPlaneReconciler) reconcilePreTerminateHook(ctx context.Co
 			return ctrl.Result{}, errors.Wrapf(err, "failed to remove etcd member for deleting Machine %s: failed to create client to workload cluster", klog.KObj(deletingMachine))
 		}
 
+		if selfHostedDeletion {
+			// Members of Machines that are already gone are removed first (see keepEtcdMember below: with three or
+			// more Machines the member of a Machine is kept until its infrastructure is gone). This happens before
+			// the next Machine is let through, so etcd never has more than one member without a Machine.
+			nodeNames := []string{}
+			for _, m := range controlPlane.Machines {
+				if m.Status.NodeRef.IsDefined() {
+					nodeNames = append(nodeNames, m.Status.NodeRef.Name)
+				}
+			}
+			removedMembers, err := workloadCluster.RemoveEtcdMembersWithoutNodes(ctx, nodeNames)
+			if err != nil {
+				return ctrl.Result{}, errors.Wrap(err, "failed to remove etcd members of control plane Machines that are already gone")
+			}
+			if len(removedMembers) > 0 {
+				log.Info("Removed etcd members of control plane Machines that are already gone", "members", removedMembers)
+			}
+		}
+
 		// Note: In regular deletion cases (remediation, scale down) the leader should have been already moved.
 		// We're doing this again here in case the Machine became leader again or the Machine deletion was
 		// triggered in another way (e.g. a user running kubectl delete machine)
 		etcdLeaderCandidate := controlPlane.Machines.Filter(collections.Not(collections.HasDeletionTimestamp)).Newest()
+		if etcdLeaderCandidate == nil && selfHostedDeletion {
+			// All control plane Machines are being deleted. Forward leadership to a Machine that is deleted after
+			// this one: preferably one that has not reached the pre-terminate hook yet, otherwise any other one.
+			etcdLeaderCandidate = selfHostedEtcdLeaderCandidate(controlPlane, deletingMachine)
+		}
 		if etcdLeaderCandidate != nil {
 			if err := workloadCluster.ForwardEtcdLeadership(ctx, deletingMachine, etcdLeaderCandidate); err != nil {
 				return ctrl.Result{}, errors.Wrapf(err, "failed to move leadership to candidate Machine %s", etcdLeaderCandidate.Name)
@@ -1289,11 +1344,23 @@ func (r *KubeadmControlPlaneReconciler) reconcilePreTerminateHook(ctx context.Co
 			log.Info("Skip forwarding etcd leadership, because there is no other control plane Machine without a deletionTimestamp")
 		}
 
-		// Note: Removing the etcd member will lead to the etcd and the kube-apiserver Pod on the Machine shutting down.
-		// If ControlPlaneKubeletLocalMode is used, the kubelet is communicating with the local apiserver and thus now
-		// won't be able to see any updates to e.g. Pods anymore.
-		if err := workloadCluster.RemoveEtcdMemberForMachine(ctx, deletingMachine); err != nil {
-			return ctrl.Result{}, errors.Wrapf(err, "failed to remove etcd member for deleting Machine %s", klog.KObj(deletingMachine))
+		// While a self-hosted cluster is being deleted the cluster's API server is also the management cluster's,
+		// and controllers reach it through the kubernetes Service. Removing a member does not stop the kube-apiserver
+		// on that Machine: it keeps serving errors for well over a minute until kubelet restarts it, and every
+		// controller whose connection is pinned to it stalls for that long. With three or more Machines etcd keeps
+		// quorum without this member, so the member is kept and the Machine's infrastructure is deleted with it in
+		// place; the API server dies with the Machine and the member is removed on the next pass (see above). With
+		// two Machines the member has to go first, otherwise the remaining member has no quorum.
+		keepEtcdMember := selfHostedDeletion && controlPlane.Machines.Len() > 2
+		if keepEtcdMember {
+			log.Info("Keeping etcd member until the Machine is gone, etcd keeps quorum without it", "etcdMembers", controlPlane.Machines.Len())
+		} else {
+			// Note: Removing the etcd member will lead to the etcd and the kube-apiserver Pod on the Machine shutting down.
+			// If ControlPlaneKubeletLocalMode is used, the kubelet is communicating with the local apiserver and thus now
+			// won't be able to see any updates to e.g. Pods anymore.
+			if err := workloadCluster.RemoveEtcdMemberForMachine(ctx, deletingMachine); err != nil {
+				return ctrl.Result{}, errors.Wrapf(err, "failed to remove etcd member for deleting Machine %s", klog.KObj(deletingMachine))
+			}
 		}
 	}
 
@@ -1303,6 +1370,31 @@ func (r *KubeadmControlPlaneReconciler) reconcilePreTerminateHook(ctx context.Co
 
 	log.Info("Waiting for Machines to be deleted", "machines", strings.Join(controlPlane.Machines.Filter(collections.HasDeletionTimestamp).Names(), ", "))
 	return ctrl.Result{RequeueAfter: deleteRequeueAfter}, nil
+}
+
+// isWaitingForPreTerminateHook returns true if the Machine controller reported that it is waiting for
+// pre-terminate hooks on the Machine.
+func isWaitingForPreTerminateHook(machine *clusterv1.Machine) bool {
+	c := conditions.Get(machine, clusterv1.MachineDeletingCondition)
+	return c != nil && c.Status == metav1.ConditionTrue && c.Reason == clusterv1.MachineDeletingWaitingForPreTerminateHookReason
+}
+
+// isSelfHostedKCPDeletion returns true if KCP itself is being deleted while the SelfHostedDeletion feature gate is
+// enabled, i.e. the pre-terminate hook is kept on the control plane Machines and the Machine controller orders
+// their deletion.
+func isSelfHostedKCPDeletion(controlPlane *internal.ControlPlane) bool {
+	return feature.Gates.Enabled(feature.SelfHostedDeletion) && !controlPlane.KCP.DeletionTimestamp.IsZero()
+}
+
+// selfHostedEtcdLeaderCandidate returns the Machine etcd leadership should be forwarded to when all control plane
+// Machines are being deleted: the newest Machine other than deletingMachine that has not reached the pre-terminate
+// hook yet (it is deleted after deletingMachine), otherwise the newest other Machine, or nil if there is none.
+func selfHostedEtcdLeaderCandidate(controlPlane *internal.ControlPlane, deletingMachine *clusterv1.Machine) *clusterv1.Machine {
+	others := controlPlane.Machines.Filter(func(m *clusterv1.Machine) bool { return m.Name != deletingMachine.Name })
+	if candidate := others.Filter(collections.Not(isWaitingForPreTerminateHook)).Newest(); candidate != nil {
+		return candidate
+	}
+	return others.Newest()
 }
 
 func machineHasOtherPreTerminateHooks(machine *clusterv1.Machine) bool {
